@@ -5,15 +5,91 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 from tqdm import tqdm
+import os
+from glob import glob
 
 # GET VIDEO ID'S
-for (key, _) in (torch.load(caption_tr_path).items()):
-    video_ids_tr.append(key)
+video_ids_tr = os.listdir(caption_tr_path)
 
-for (key, _) in (torch.load(caption_vl_path).items()):
-    video_ids_vl.append(key)
+video_ids_tr = [item[:-3] for item in video_ids_tr]
+
+video_ids_vl = os.listdir(caption_vl_path)
+video_ids_vl = [item[:-3] for item in video_ids_vl]
 
 all_video_ids = video_ids_tr + video_ids_vl
+
+def create_vocab():
+
+    idx2word_dict = {}
+    idx2word_dict[0] = 'SOS'
+    idx2word_dict[1] = 'EOS'
+    idx = 2
+
+    for vid in all_video_ids:
+        if vid in video_ids_tr:
+            video_cap = torch.load(caption_tr_path + vid + '.pt')
+        else:
+            video_cap = torch.load(caption_vl_path + vid + '.pt')
+
+        for cap in video_cap[vid]:
+            for word in cap.split(' '):
+                if word not in list(idx2word_dict.values()):
+                    idx2word_dict[idx] = word
+                    idx += 1
+
+    return idx2word_dict
+
+def caption_info():
+    '''
+    max Cap/video and max word/caption
+    '''
+    max_cap_per_vid = 0
+    max_word_per_cap = 0
+
+    for vid in all_video_ids:
+        if vid in video_ids_tr:
+            video_cap = torch.load(caption_tr_path + vid + '.pt')
+        else:
+            video_cap = torch.load(caption_vl_path + vid + '.pt')
+
+        max_cap_per_vid = max(max_cap_per_vid, len(video_cap[vid]))
+
+        for cap in video_cap[vid]:
+            max_word_per_cap = max(max_word_per_cap, len(cap.split()))
+
+    return max_cap_per_vid, max_word_per_cap
+
+def max_frame_per_video():
+
+    max_frame = 0
+
+    for vid in all_video_ids:
+        if vid in video_ids_tr:
+            video_cap = torch.load(resnet_features_tr_path + vid + '.pt')
+        else:
+            video_cap = torch.load(resnet_features_vl_path + vid + '.pt')
+
+        max_frame = max(max_frame, len(video_cap))
+
+    return max_frame
+
+# Change object file from temp.py
+
+def max_object_per_frame():
+
+    max_objects = 0
+
+    for vid in all_video_ids:
+        if vid in video_ids_tr:
+            video_cap = torch.load(object_features_tr_path + vid + '.pt')
+        else:
+            video_cap = torch.load(object_features_vl_path + vid + '.pt')
+
+        for frame, _ in video_cap.items():
+            max_objects = max(max_objects, len(video_cap[frame]))
+
+    return max_objects
+
 
 # CAPTION FEATURES LOADER
 class Caption_loader:
@@ -22,122 +98,83 @@ class Caption_loader:
     Task : Generate caption/video dict, index to word dictionary, caption tensor
     Dim : Caption Tensor of size [#captions, #words/caption, word_dim]
     '''
-    def __init__(self, train=True, all_vids):
+    def __init__(self, max_cap_per_vid, max_word_per_cap, train=True):
         if train == True:
-            caption_features_path = caption_features_tr_path
-            caption_sents_path = caption_tr_path
+            self.caption_features_path = caption_features_tr_path
         else:
-            caption_features_path = caption_vl_path
-            caption_sents_path = caption_vl_path
+            self.caption_features_path = caption_vl_path
 
-        #  dictionary maintaining #captions per video.
-        self.capt_per_video = {}
+        self.max_cap_per_vid = max_cap_per_vid
+        self.max_word_per_cap = max_word_per_cap
 
-        # Set up caption dictionary for visualisation of predicted sentences
-        self.idx2word_dict = {}
-        self.idx2word_dict[0] = 'BOS'
-        self.idx2word_dict[1] = 'EOS'
-        idx = 2
+    def video_instances(self, vids):
+        video_inst = []
+        for vid in vids:
+            video_ftrs = torch.load(self.caption_features_path + vid + '.pt')
+            video_inst.append(len(video_ftrs[vid]))
 
-        for vid in all_vids:
-            video_cap = torch.load(caption_sents_path + vid + '.pt')
-            for cap in video_cap[vid]:
-                for word in cap.split(' '):
-                    if word not in list(self.idx2word_dict.values())
-                        self.idx2word_dict[idx] = word
-                        idx += 1
+        return video_inst
 
-        # Check max words per caption in all videos.
-        self.max_word_per_sent = 0
-        for vid in all_vids:
-            video_features = torch.load(caption_features_path + vid + '.pt')
-            for cap in video_features[vid]:
-                self.word_size = cap.shape[1]
-                self.max_word_per_sent = max(self.max_word_per_sent, cap.shape[0])
-
-
-    def get_capt_per_video(self):
-        return self.capt_per_video
 
     def get_tensor(self, vids):
         total_captions = 0
         for vid in vids:
-            for cap in vid:
-                total_captions += 1
+            video_ftrs = torch.load(self.caption_features_path + vid + '.pt')
+            total_captions += len(video_ftrs[vid])
 
-        captions = torch.zeros((total_captions, self.max_word_per_sent, self.word_size))
+        captions = torch.zeros((total_captions, self.max_word_per_cap, word_dim))
 
         cap_num = 0
         for vid in vids:
-            for cap in vid:
+            video_ftrs = torch.load(self.caption_features_path + vid + '.pt')
+            for cap in video_ftrs[vid]:
                 words_in_sent = cap.shape[0]
-                captions[cap_num,0:words_in_sent-1,:] = torch.from_numpy(cap)
+                captions[cap_num,0:words_in_sent,:] = torch.from_numpy(cap)
                 cap_num += 1
 
         return captions
 
-    def dictionary_size(self):
-        return len(self.idx2word_dict)
+# OBJECT FEATURES LOADER
+class Object_features():
+    '''
+    Input : Video id list, #caption/video
+    Task : Generate object tensor
+    Dim : Object Tensor of size [#videos instances = #captions for video id list
+                                , #frames, #objects ,object_size]
+    '''
 
-    def get_word(self, idx):
-        return self.idx2word_dict[idx]
-#
-#
-# # OBJECT FEATURES LOADER
-# class Object_features():
-#     '''
-#     Input : Video id list, #caption/video
-#     Task : Generate object tensor
-#     Dim : Object Tensor of size [#videos instances = #captions for video id list
-#                                 , #frames, #objects ,object_size]
-#     '''
-#
-#     def __init__(self, train=True, all_vids):
-#         if train == True:
-#             self.object_features_path = object_features_tr_path
-#         else:
-#             self.object_features_path = object_features_vl_path
-#
-#         self.max_frm_per_video = 0
-#         self.max_obj_per_frm = 0
-#
-#         for i, vid in enumerate(all_vids):
-#             object_features = torch.load(self.object_features_path + vid + '.pt')
-#             self.max_frm_per_video = max(self.max_frm_per_video, len(list(object_features.keys()))
-#
-#             for frm in list(object_features.values):
-#                 if len(frm) != 0: # object is detected in the frame.
-#                     self.object_size = np.prod(frm[0]['feature'].shape)
-#                     self.max_obj_per_frm = max(self.max_obj_per_frm, len(frm))
-#
-#     def frame_per_video(self):
-#         return self.max_frm_per_video
-#
-#     def object_per_frame(self):
-#         return self.max_obj_per_frm
-#
-#     def get_tensor(self, vids, captions_per_video):
-#         video_instances = sum(list(captions_per_video.values()))
-#
-#         object_tensor = torch.zeros((video_instances, self.max_frm_per_video, \
-#                                     self.max_obj_per_frm, self.object_size))
-#
-#         vd_start_instance = 0
-#         for vid in vids:
-#             object_features = torch.load(self.object_features_path + vid + '.pt')
-#             for j, frame in enumerate(list(object_features.values())):
-#                 if len(frame) != 0:
-#                     for k, (_, obj) in enumerate(list(frame.items()):
-#                         object_tensor[vd_start_instance,j,k] = torch.from_numpy(obj['feature'])
-#
-#             object_tensor[vd_start_instance:vd_start_instance + captions_per_video[vid]] = \
-#             object_tensor[vd_start_instance].unsqueeze(0). \
-#             repeat(captions_per_video[vid],max_frm_per_video,max_obj_per_frm,object_size)
-#
-#             vd_start_instance += captions_per_video[vid]
-#
-#         return object_tensor
-#
+    def __init__(self, max_frame, max_object, train=True):
+        if train == True:
+            self.object_features_path = object_features_tr_path
+        else:
+            self.object_features_path = object_features_vl_path
+
+        self.max_frm_per_video = max_frame
+        self.max_obj_per_frm = max_object
+
+    def get_tensor(self, vids, video_instances):
+
+        total_instances = sum(video_instances)
+
+        object_tensor = torch.zeros((total_instances, self.max_frm_per_video, \
+                                    self.max_obj_per_frm, object_dim))
+
+        vd_start_instance = 0
+        for i, vid in enumerate(vids):
+            object_features = torch.load(self.object_features_path + vid + '.pt')
+            for j, frame in enumerate(object_features.values()):
+                if len(frame) != 0:
+                    for k, obj in enumerate(frame):
+                        feature = list(obj.values())[0]['feature']
+                        object_tensor[vd_start_instance,j,k] = torch.from_numpy(feature)
+
+            object_tensor[vd_start_instance:vd_start_instance + video_instances[i]] = \
+            object_tensor[vd_start_instance].unsqueeze(0). \
+            repeat(video_instances[i], 1, 1, 1)
+
+            vd_start_instance += video_instances[i]
+
+        return object_tensor
 #
 # # RESNET FEATURES LOADER
 # class Resnet_features:
@@ -389,14 +426,27 @@ class Caption_loader:
 #
 #
 #
-# if __name__ == "__main__":
-#
-    captions = Caption_loader(train=True, all_vids=all_video_ids)
-    
+if __name__ == "__main__":
 
+    vocabulary = create_vocab()
+    max_cap_per_vid, max_word_per_cap = caption_info()
 
+    captions = Caption_loader(max_cap_per_vid, max_word_per_cap, train=True)
+    caption_tensor = captions.get_tensor(['vid1', 'vid2'])
+    video_inst = captions.video_instances(['vid1', 'vid2'])
 
-#     objects = Object_features(train=True, all_vids=all_video_ids)
+    print('caption tensor', caption_tensor.shape)
+    print('video instances', video_inst)
+
+    max_frame = max_frame_per_video()
+    max_objects = max_object_per_frame()
+
+    objects = Object_features(max_frame, max_objects, train=True)
+
+    object_tensor = objects.get_tensor(['vid1', 'vid2'], video_inst)
+
+    print('object tensor', object_tensor.shape)
+
 #     optical_flow = Optical_features(train=True,all_vids=all_video_ids)
 #     resnet = Resnet_features(train=True, all_vids=all_video_ids)
 #
