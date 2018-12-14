@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import os
 from glob import glob
+import random
 
 # GET VIDEO ID'S
 video_ids_tr = os.listdir(caption_tr_path)
@@ -17,6 +18,11 @@ video_ids_vl = os.listdir(caption_vl_path)
 video_ids_vl = [item[:-3] for item in video_ids_vl]
 
 all_video_ids = video_ids_tr + video_ids_vl
+
+# Dictionary of word:vector
+word2vec = torch.load(word2vec_path)
+word2vec['SOS'] = np.zeros((word_dim))
+word2vec['EOS'] = np.ones((word_dim))
 
 def create_vocab():
 
@@ -334,71 +340,119 @@ class Attention(nn.Module):
         print('video attended', video_attended.shape)
         return video_attended, self.attn1, self.attn2, self.attn3
 
-# class Caption(nn.Module):
-#     def __init__(self, hidden_size, num_layers, bidirectional=False):
-#
-#         super(Caption, self).__init__()
-#
-#         num_directions = 2 is bidirectional else 1
-#
-#         # Encoder lstm
-#         self.elstm = nn.LSTM(input_size=resnet_dim, hidden_size = hidden_size, \
-#                              num_layers=num_layers, batch_first=True, dropout=0.5, \
-#                              bidirectional=bidirectional)
-#
-#         # Decoder lstm
-#         self.dlstm = nn.LSTM(input_size=word_dim, hidden_size = hidden_size, \
-#                              num_layers = num_layers, batch_first=True, dropout=0.5, \
-#                              bidirectional=bidirectional)
-#
-#         self.caption = nn.Sequential(nn.Linear(num_directions*hidden_size, word_dim), \
-#                                     nn.Softmax(dim=1))
-#
-#
-#     def forward(video_tensor):
-#         encoder_out, encoder_hidden = self.elstm(video_tensor)
-#         # output [1, 1, 2048], hidden [1, numlayer*num_dir, hidden_size]
-#
-#         decoder_out, _ = self.dlstm(video_tensor, encoder_hidden)
-#         # output [1, 1, 300]
-#
-#         return decoder_out
 
+class Encoder(nn.Module):
+    def __init__(self, hidden_size, num_layers, bidirectional=False):
+
+        super(Encoder, self).__init__()
+
+        self.num_directions = 2 if bidirectional else 1
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+
+        # Encoder lstm
+        self.elstm = nn.LSTM(input_size=resnet_dim, hidden_size = self.hidden_size, \
+                             num_layers=self.num_layers, batch_first=True, \
+                             bidirectional=bidirectional)
+
+    def forward(self, video_tensor, encoder_hidden):
+        _, encoder_hidden = self.elstm(video_tensor, encoder_hidden)
+        # output [1, 1, 2048], hidden [1, numlayer*num_dir, hidden_size]
+
+        return encoder_hidden
+
+    def init_hidden(self):
+        return torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size)), \
+               torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size))
+
+
+class Decoder(nn.Module):
+    def __init__(self, hidden_size, num_layers, bidirectional=False):
+
+        super(Decoder, self).__init__()
+
+        num_directions = 2 if bidirectional else 1
+
+        # Decoder lstm
+        self.dlstm = nn.LSTM(input_size=word_dim, hidden_size = hidden_size, \
+                             num_layers = num_layers, batch_first=True, \
+                             bidirectional=bidirectional)
+
+        self.caption = nn.Sequential(nn.Linear(num_directions*hidden_size, word_dim), \
+                                    nn.Softmax(dim=1))
+
+
+    def forward(self, word_tensor, encoder_hidden):
+
+        decoder_out, _ = self.dlstm(word_tensor, encoder_hidden)
+        decoder_out = self.caption(decoder_out)
+        # output [1, 1, 300]
+
+        return decoder_out
 
 
 # TRAIN NETWORK
-# def train(model, captions, objects, optical_flow, resnet, n_iters, lr_rate, batch_size):
-#
-#     model_optimizer = optim.Adam(model.parameters(), lr=lr_rate)
-#     criterion = nn.MSELoss()
-#
-#     for epoch in tqdm(range(n_iters)):
-#
-#         loss = 0
-#         data_iters = math.ceil(len(video_ids_tr) / batch_size)
-#
-#         for i in range(data_iters):
-#
-#             start = i*batch_size
-#             end = min((i+1)*batch_size, len(video_ids_tr))
-#             vids = video_ids_tr[start:end]
-#
-#             cap_gtruth = captions.get_tensor(vids)
-#             obj_ftrs = objects.get_tensor(vids)
-#             opt_ftrs = optical_flow.get_tensor(vids)
-#             res_ftrs = resnet.get_tensor(vids)
-#
-#             video_instns = cap_ftr.shape[0]
-#
-#             caption_pred, attn1, attn2, attn3 = model(video_instns, res_ftrs, opt_ftrs, obj_ftrs, cap_gtruth)
-#
-#             loss += criterion(cap_gtruth, caption_pred)
-#
-#             loss.backward()
-#             model_optimizer.step()
-#
-#         print(loss)
-#
+def train(attention, encoder, decoder, captions, objects, optical_flow, resnet, n_iters, lr_rate, batch_size, dec_max_time_step):
+
+    model_optimizer = optim.Adam(model.parameters(), lr=lr_rate)
+    criterion = nn.MSELoss()
+
+    for epoch in tqdm(range(n_iters)):
+
+        loss = 0
+        data_iters = math.ceil(len(video_ids_tr) / batch_size)
+
+        for i in range(data_iters):
+
+            start = i*batch_size
+            end = min((i+1)*batch_size, len(video_ids_tr))
+            vids = video_ids_tr[start:end]
+
+            object_tensor = objects(vids)
+            optical_tensor = optical_flow(vids)
+            resnet_tensor = resnet(vids)
+            caption_tensor = caption(vids)
+
+            video_inst = captions.video_instances(vids)
+
+            video_attended, _, _, _ = attention(video_inst, resnet_tensor, optical_tensor, object_tensor)
+
+            for i in range(sum(video_inst)):
+
+                encoder_hidden = encoder.init_hidden()
+
+                for frame_num in range(max_frame): # Run Encoder for one video.
+                    frame = video_attended[i, frame_num].view(1, 1, resnet_dim)
+                    encoder_hidden = encoder(frame, encoder_hidden)
+
+                # Run Decoder for one sentence
+                use_teacher_forcing = True if random.random() < teacher_force_ratio else False
+                word_tensor = torch.zeros((1,1,word_dim)) # SOS
+
+                if use_teacher_forcing:
+                    # Decoder input is ground truth
+
+                else:
+                    # Decoder input is previous predicted word
+                    for t in range(dec_max_time_step):
+                        decoder_out = decoder(word_tensor, encoder_hidden)
+                        word_tensor = decoder_out
+
+                        loss += criterion(word_tensor, '''get ground truth caption''')
+
+
+
+
+
+
+
+            loss += criterion(cap_gtruth, caption_pred)
+
+            loss.backward()
+            model_optimizer.step()
+
+        print(loss)
+
 #
 # def evaluate(model, captions, objects, optical_flow, resnet, n_iters, lr_rate, batch_size):
 #
@@ -409,39 +463,59 @@ class Attention(nn.Module):
 
 if __name__ == "__main__":
 
+    # Dataset info.
     vocabulary = create_vocab()
     max_cap_per_vid, max_word_per_cap = caption_info()
-
-    captions = Caption_loader(max_cap_per_vid, max_word_per_cap, train=True)
-    caption_tensor = captions.get_tensor(['vid1', 'vid2'])
-    video_inst = captions.video_instances(['vid1', 'vid2'])
-
-    print('caption tensor', caption_tensor.shape)
-    print('video instances', video_inst)
-
     max_frame = max_frame_per_video()
     max_objects = max_object_per_frame()
 
+    # Data loader.
     objects = Object_features(max_frame, max_objects, train=True)
+    resnet = Resnet_features(max_frame, train=True)
+    optical = Optical_features(max_frame, train=True)
+    captions = Caption_loader(max_cap_per_vid, max_word_per_cap, train=True)
+
+    attention = Attention(max_frame, max_objects, bi_dir)
+    encoder = Encoder(hidden_size, num_layers, bi_dir)
+    decoder = Decoder(hidden_size, num_layers, bi_dir)
+
+    train(attention, encoder, decoder, captions, objects, optical, resnet, num_epoch, learning_rate, batch_size, max_word_per_cap)
+
+    caption_tensor = captions.get_tensor(['vid1', 'vid2'])
+    video_inst = captions.video_instances(['vid1', 'vid2'])
 
     object_tensor = objects.get_tensor(['vid1', 'vid2'], video_inst)
 
-    print('object tensor', object_tensor.shape)
-
-    resnet = Resnet_features(max_frame, train=True)
     resnet_tensor = resnet.get_tensor(['vid1', 'vid2'], video_inst)
 
-    print('resnet', resnet_tensor.shape)
-
-    optical = Optical_features(max_frame, train=True)
     optical_tensor = resnet.get_tensor(['vid1', 'vid2'], video_inst)
 
-    print('optcial', optical_tensor.shape)
-
-    attention = Attention(max_frame, max_objects, bi_dir)
 
     video_attended, _, _, _ = attention(video_inst, resnet_tensor, optical_tensor, object_tensor)
     print('video attended', video_attended.shape)
+
+    loss = 0
+
+
+
+    for i in range(sum(video_inst)):
+
+        encoder_hidden = encoder.init_hidden()
+
+        for frame_num in range(max_frame): # Run Encoder for each frame
+            frame = video_attended[i, frame_num].view(1, 1, resnet_dim)
+            encoder_hidden = encoder(frame, encoder_hidden)
+
+        word_tensor = torch.zeros((1,1,word_dim)) # SOS
+
+        for t in range(max_word_per_cap):
+            # RUN DECODER
+            decoder_out = decoder(word_tensor, encoder_hidden)
+            word_tnsor = decoder_out
+
+
+    print('encoder hidden', encoder_hidden[0].shape)
+    print('decoder output', decoder_out.shape)
 
 #     optical_flow = Optical_features(train=True,all_vids=all_video_ids)
 #     resnet = Resnet_features(train=True, all_vids=all_video_ids)
