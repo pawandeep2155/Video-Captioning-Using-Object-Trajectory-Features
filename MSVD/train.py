@@ -9,10 +9,14 @@ import os
 from glob import glob
 import random
 import math
+from tensorboard_logger import configure, log_value
+
+configure("../../dataset/MSVD/tensorboard/run-1")
+
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
 # GET VIDEO ID'S
 video_ids_tr = os.listdir(caption_tr_path)
-
 video_ids_tr = [item[:-3] for item in video_ids_tr]
 
 video_ids_vl = os.listdir(caption_vl_path)
@@ -350,8 +354,8 @@ class Encoder(nn.Module):
         return encoder_hidden
 
     def init_hidden(self):
-        return torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size)), \
-               torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size))
+        return (torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size))).to(device), \
+               (torch.zeros((1, self.num_layers*self.num_directions, self.hidden_size))).to(device)
 
 
 class Decoder(nn.Module):
@@ -406,12 +410,12 @@ def train(attention, encoder, decoder, captions, objects, optical_flow, resnet, 
             end = min((i+1)*batch_size, len(video_ids_tr))
             vids = video_ids_tr[start:end]
 
-            caption_tensor = captions.get_tensor(vids)
+            caption_tensor = captions.get_tensor(vids).to(device)
             video_inst = captions.video_instances(vids)
 
-            object_tensor = objects.get_tensor(vids, video_inst)
-            optical_tensor = optical_flow.get_tensor(vids, video_inst)
-            resnet_tensor = resnet.get_tensor(vids, video_inst)
+            object_tensor = objects.get_tensor(vids, video_inst).to(device)
+            optical_tensor = optical_flow.get_tensor(vids, video_inst).to(device)
+            resnet_tensor = resnet.get_tensor(vids, video_inst).to(device)
 
             video_attended, _, _, _ = attention(video_inst, resnet_tensor, optical_tensor, object_tensor)
 
@@ -425,7 +429,7 @@ def train(attention, encoder, decoder, captions, objects, optical_flow, resnet, 
 
                 # Run Decoder for one sentence
                 use_teacher_forcing = True if random.random() < teacher_force_ratio else False
-                word_tensor = torch.zeros((1,1,word_dim)) # SOS
+                word_tensor = torch.zeros((1,1,word_dim)).to(device) # SOS
 
                 if use_teacher_forcing:
                     # Decoder input is ground truth
@@ -451,31 +455,38 @@ def train(attention, encoder, decoder, captions, objects, optical_flow, resnet, 
             encoder_optimizer.step()
             decoder_optimizer.step()
 
+        log_value('Training Loss', loss, epoch)
+
+        # Save model parameters
+        params = {'attention':attention.state_dict(), \
+                  'encoder':encoder.state_dict(), 'decoder':decoder.state_dict()}
+        torch.save(params, model_params_path + str(epoch) + '.pt')
+
         # Validation Loss, Bleu scores etc. after each epoch
         attention = attention.eval()
         encoder = encoder.eval()
         decoder = decoder.eval()
-        validate(attention, encoder, decoder, captions_vl, objects_vl, optical_vl, resnet_vl, batch_size, dec_max_time_step)
+        validate(epoch, attention, encoder, decoder, captions_vl, objects_vl, optical_vl, resnet_vl, batch_size, dec_max_time_step)
 
-def validate(attention, encoder, decoder, captions, objects, optical_flow, resnet, batch_size,dec_max_time_step):
+def validate(tr_epoch, attention, encoder, decoder, captions, objects, optical_flow, resnet, batch_size,dec_max_time_step):
 
     criterion = nn.MSELoss()
     data_iters = math.ceil(len(video_ids_vl) / batch_size)
 
-    for batch_num in tqdm(range(data_iters)):
+    loss = 0
 
-        loss = 0
+    for batch_num in tqdm(range(data_iters)):
 
         start = batch_num*batch_size
         end = min((batch_num+1)*batch_size, len(video_ids_vl))
         vids = video_ids_vl[start:end]
 
-        caption_tensor = captions.get_tensor(vids)
+        caption_tensor = captions.get_tensor(vids).to(device)
         video_inst = captions.video_instances(vids)
 
-        object_tensor = objects.get_tensor(vids, video_inst)
-        optical_tensor = optical_flow.get_tensor(vids, video_inst)
-        resnet_tensor = resnet.get_tensor(vids, video_inst)
+        object_tensor = objects.get_tensor(vids, video_inst).to(device)
+        optical_tensor = optical_flow.get_tensor(vids, video_inst).to(device)
+        resnet_tensor = resnet.get_tensor(vids, video_inst).to(device)
 
         video_attended, _, _, _ = attention(video_inst, resnet_tensor, optical_tensor, object_tensor)
 
@@ -487,7 +498,7 @@ def validate(attention, encoder, decoder, captions, objects, optical_flow, resne
                 frame = video_attended[i, frame_num].view(1, 1, resnet_dim)
                 encoder_hidden = encoder(frame, encoder_hidden)
 
-            word_tensor = torch.zeros((1,1,word_dim)) # SOS
+            word_tensor = torch.zeros((1,1,word_dim)).to(device) # SOS
 
             # Decoder input is previous predicted word
             for t in range(dec_max_time_step):
@@ -496,6 +507,8 @@ def validate(attention, encoder, decoder, captions, objects, optical_flow, resne
 
                 loss += criterion(decoder_out, word_ground_truth)
                 word_tensor = decoder_out
+
+    log_value('Validation Loss', loss, tr_epoch)
 
 if __name__ == "__main__":
 
@@ -516,9 +529,9 @@ if __name__ == "__main__":
     optical_vl = Optical_features(max_frame, train=False)
     captions_vl = Caption_loader(max_cap_per_vid, max_word_per_cap, train=False)
 
-    attention = Attention(max_frame, max_objects, bi_dir)
-    encoder = Encoder(hidden_size, num_layers, bi_dir)
-    decoder = Decoder(hidden_size, num_layers, bi_dir)
+    attention = Attention(max_frame, max_objects, bi_dir).to(device)
+    encoder = Encoder(hidden_size, num_layers, bi_dir).to(device)
+    decoder = Decoder(hidden_size, num_layers, bi_dir).to(device)
 
     train(attention, encoder, decoder, captions, objects, optical, resnet, \
           objects_vl, resnet_vl, optical_vl, captions_vl, num_epoch, \
