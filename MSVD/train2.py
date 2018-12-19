@@ -120,7 +120,6 @@ class Object_features():
         else:
             self.object_features_path = object_features_vl_path
 
-
     def get_item(self, vids):
 
         objects = []
@@ -203,33 +202,57 @@ class Optical_features:
 
         return optical
 
-def pad_tensor(vec, pad, dim, max_cap):
+def pad_tensor(vec, pad, dim, repeat=1):
     pad_size = list(vec.shape)
     pad_size[dim] = pad - vec.size(dim)
     vec = torch.cat([vec, torch.zeros(*pad_size)], dim=dim)
-    vec = vec.repeat(max_cap,1,1)
-
-    print('vec', vec.shape)
     return vec
 
 class PadCollate:
 
-    def __init__(self, dim=0):
-        self.dim = dim
+    def __init__(self, max_caption):
+        self.max_cap_per_vid = max_caption
 
     def pad_collate(self, batch):
-        # find longest sequence
-        max_lenx = max(map(lambda x: x[0].shape[self.dim], batch))
-        max_leny = max(map(lambda x: x[1].shape[self.dim], batch))
 
-        # pad according to max_len
-        batchx = list(map(lambda x: pad_tensor(x[0], pad=max_lenx, dim=self.dim, max_cap=40), batch))
-        batchy = list(map(lambda x: pad_tensor(x[1], pad=max_leny, dim=self.dim, max_cap=40), batch))
+        object_data, optical_data, resnet_data, caption_data = batch[0], batch[1], batch[2], batch[3]
 
-        xs = torch.cat(batchx, dim=0)
-        ys = torch.stack(batchy)
+        # Object padding in 3 levels.
+        # Level1
+        object_data_padded = []
+        for i in range(len(object_data)):
+            video_i = object_data[i]
+            max_lenx = max(map(lambda x: x.shape[0], video_i))
+            batchx = list(map(lambda x: pad_tensor(x[0], pad=max_lenx, dim=0), batch))
+            video_i_padded = torch.stack(batchx, dim=0)
+            object_data_padded.append(video_i_padded)
+        # Level2
+        max_lenx = max(map(lambda x: x.shape[1], object_data_padded))
+        object_data_padded = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=1), object_data_padded))
+        # Level3
+        max_lenx = max(map(lambda x: x.shape[0], object_data_padded))
+        object_data_padded = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), object_data_padded))
+        object_data_padded = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid, 1, 1, 1), object_data_padded))
+        object_tensor = torch.cat(object_data_padded, dim=0)
 
-        return xs, ys
+        # Optical Padding
+        max_lenx = max(map(lambda x: x.shape[0], optical_data))
+        optical_data_padded = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), optical_data))
+        optical_data_padded = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid, 1, 1), optical_data_padded))
+        optical_tensor = torch.cat(optical_data_padded, dim=0)
+
+        # Resnet Padding
+        max_lenx = max(map(lambda x: x.shape[0], resnet_data))
+        resnet_data_padded = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), resnet_data))
+        resnet_data_padded = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid, 1, 1), resnet_data_padded))
+        resnet_tensor = torch.cat(resnet_data_padded, dim=0)
+
+        # Caption Padding
+        max_lenx = max(map(lambda x: x.shape[0], caption_data))
+        caption_data_padded = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), caption_data))
+        caption_tensor = torch.stack(caption_data_padded, dim=0)
+
+        return object_tensor, optical_tensor, resnet_tensor, caption_tensor
 
     def __call__(self, batch):
         return self.pad_collate(batch)
@@ -521,16 +544,23 @@ if __name__ == "__main__":
 
     print('dataloader starting...')
 
-    # Data loader.
-    objects = Object_features(max_frame, max_objects, train=True)
-    resnet = Resnet_features(max_frame, train=True)
-    optical = Optical_features(max_frame, train=True)
-    captions = Caption_loader(max_cap_per_vid, max_word_per_cap, train=True)
+    # Training Data loader.
+    objects = Object_features(train=True)
+    resnet = Resnet_features(train=True)
+    optical = Optical_features(train=True)
+    captions = Caption_loader(train=True)
 
-    objects_vl = Object_features(max_frame, max_objects, train=False)
-    resnet_vl = Resnet_features(max_frame, train=False)
-    optical_vl = Optical_features(max_frame, train=False)
-    captions_vl = Caption_loader(max_cap_per_vid, max_word_per_cap, train=False)
+    dataset_tr = VideoDataset(max_cap_per_vid, captions, objects, optical, resnet)
+    dataloader_tr = DataLoader(dataset_tr, batch_size=batch_size, shuffle=True, collate_fn=PadCollate(max_cap_per_vid))
+
+    # Validation Data loader.
+    objects_vl = Object_features(train=False)
+    resnet_vl = Resnet_features(train=False)
+    optical_vl = Optical_features(train=False)
+    captions_vl = Caption_loader(train=False)
+
+    dataset_vl = VideoDataset(max_cap_per_vid, captions_vl, objects_vl, optical_vl, resnet_vl)
+    dataloader_vl = DataLoader(dataset_vl, batch_size=batch_size, shuffle=True, collate_fn=PadCollate(max_cap_per_vid))
 
     attention = Attention(max_frame, max_objects, bi_dir).to(device)
     encoder = Encoder(hidden_size, num_layers, bi_dir).to(device)
