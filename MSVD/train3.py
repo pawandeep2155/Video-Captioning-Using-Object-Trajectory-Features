@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.autograd import Variable
 from tqdm import tqdm
 import os
 from glob import glob
@@ -55,9 +56,6 @@ class PadCollate:
         self.max_cap_per_vid = max_caption
 
     def pad_collate(self, batch):
-        print('pad collate batch', len(batch), len(batch[0]), len(batch[1]))
-        print('batch dims', batch[0][0].shape, batch[0][1].shape, batch[0][2].shape, batch[0][3].shape)
-        print('batch dims', batch[1][0].shape, batch[1][1].shape, batch[1][2].shape, batch[1][3].shape)
 
         object_data = []
         optical_data = []
@@ -79,21 +77,18 @@ class PadCollate:
         object_list = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), object_list))
         object_list = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid,1,1,1), object_list))
         object_tensor = torch.cat(object_list, dim=0)
-        print('object', object_tensor.shape)
 
         # Padding Optical
         max_lenx = max(map(lambda x: x.shape[0], optical_data))
         optical_list = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), optical_data))
         optical_list = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid,1,1), optical_list))
         optical_tensor = torch.cat(optical_list, dim=0)
-        print('optical', optical_tensor.shape)
 
         # Padding Resnet
         max_lenx = max(map(lambda x: x.shape[0], resnet_data))
         resnet_list = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), resnet_data))
         resnet_list = list(map(lambda x: x.unsqueeze(0).repeat(self.max_cap_per_vid,1,1), resnet_list))
         resnet_tensor = torch.cat(resnet_list, dim=0)
-        print('resnet', resnet_tensor.shape)
 
         # Padding Captions
         max_lenx = max(map(lambda x: x.shape[1], caption_data))
@@ -102,7 +97,6 @@ class PadCollate:
         caption_list = list(map(lambda x: pad_tensor(x, pad=max_lenx, dim=0), caption_list))
         caption_list = list(map(lambda x: pad_tensor(x, pad=self.max_cap_per_vid, dim=0), caption_list))
         caption_tensor = torch.cat(caption_list, dim=0)
-        print('caption', caption_tensor.shape)
 
         return object_tensor, optical_tensor, resnet_tensor, caption_tensor
 
@@ -139,11 +133,64 @@ class VideoDataset(DataLoader):
 # NETWORK
 class Attention(nn.Module):
 
-    def __init__(self, num_frames, obj_per_frame, bi_dir):
-        pass
+    def __init__(self, bi_dir):
+        super(Attention, self).__init__()
+        self.bi_dir = bi_dir
 
-    def forward(self, video_instances, resnet_ftrs, optical_ftrs, object_ftrs):
-        pass
+        self.attn1 = Variable(torch.rand(object_dim), requires_grad=True)
+        self.attn2 = Variable(torch.rand(resnet_dim), requires_grad=True)
+        self.attn3 = Variable(torch.rand(resnet_dim), requires_grad=True)
+
+        self.softmax1 = nn.Softmax(dim=2)
+        self.softmax2 = nn.Softmax(dim=2)
+        self.softmax3 = nn.Softmax(dim=1)
+
+    def forward(self, resnet_ftrs, optical_ftrs, object_ftrs):
+        num_videos, num_frm, num_obj, _ = list(object_ftrs.shape)
+
+        # ATTENTION LEVEL 1
+        attn1_ext = self.attn1.repeat(num_videos, num_frm, num_obj, 1)
+        attn1 = torch.bmm(object_ftrs.view(num_videos*num_frm*num_obj, 1, object_dim), \
+                                    attn1_ext.view(num_videos*num_frm*num_obj, object_dim, 1))
+        # (40*100*5,1,1)
+        attn1 = attn1.view(num_videos, num_frm, num_obj)
+        # (40,100,5)
+        attn1 = self.softmax1(attn1)
+        object_attended = torch.bmm(attn1.view(num_videos*num_frm, 1, num_obj), object_ftrs.view(num_videos*num_frm, num_obj, object_dim))
+        # (40*100, 1, 2048)
+        object_attended = object_attended.view(num_videos, num_frm, object_dim)
+        # (40, 100, 2048)
+
+        # ATTENTION LEVEL 2
+        combine_ftrs = torch.stack((resnet_ftrs, optical_ftrs, object_attended), dim=2)
+        # (40, 100, 3, 2048)
+        attn2_ext = self.attn2.repeat(num_videos, num_frm, 3, 1)
+        # (40, 100, 3, 2048)
+        attn2 = torch.bmm(combine_ftrs.view(num_videos*num_frm*3, 1, resnet_dim), \
+                          attn2_ext.view(num_videos*num_frm*3,resnet_dim, 1))
+        # (40*100*3, 1, 1)
+        attn2 = attn2.view(num_videos, num_frm, 3)
+        # (400, 100, 3)
+        attn2 = self.softmax2(attn2)
+        combine_attended = torch.bmm(attn2.view(num_videos*num_frm, 1, 3), \
+                            combine_ftrs.view(num_videos*num_frm, 3, object_dim))
+        # (40*100,1,2048)
+        combine_attended = combine_attended.view(num_videos, num_frm, resnet_dim)
+        # (40,100,2048)
+
+        # ATTENTION LEVEL 3
+        attn3_ext = self.attn3.repeat(num_videos, num_frm, 1)
+        # (40, 100, 2048)
+        attn3 = torch.bmm(combine_attended.view(num_videos*num_frm, 1, resnet_dim),  \
+                          attn3_ext.view(num_videos*num_frm, resnet_dim, 1))
+        # (40*100, 1, 1)
+        attn3 = self.softmax3(attn3.view(num_videos, num_frm, 1))
+        video_attended = torch.bmm(attn3.view(num_videos*num_frm,1,1), combine_attended.view(num_videos*num_frm, 1, resnet_dim))
+        # (40*100, 1, 2048)
+        video_attended = video_attended.view(num_videos, num_frm, resnet_dim)
+        # (40, 100, 2048)
+
+        return video_attended, attn1, attn2, attn3
 
 class Encoder(nn.Module):
     def __init__(self, hidden_size, num_layers, bidirectional=False):
@@ -329,12 +376,16 @@ if __name__ == "__main__":
 
     dataset_tr = VideoDataset(video_ids_tr)
     dataloader_tr = DataLoader(dataset_tr, batch_size=batch_size, shuffle=True, collate_fn=PadCollate(max_cap_per_vid))
+    attention = Attention(bi_dir)
 
     for i, data in enumerate(dataloader_tr):
         print('data', type(data))
         object_t, optical_t, resnet_t, caption_t = data[0], data[1], data[2], data[3]
 
         print('Tensors' ,object_t.shape, optical_t.shape, resnet_t.shape, caption_t.shape)
+        video_attn,_,_,_ = attention(resnet_t, optical_t, object_t)
+        print('video attended', video_attn.shape)
+
 
         break
 
